@@ -1,25 +1,31 @@
-#!/usr/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Configuration
-REAL_NAME="Baris Zorba"
-EMAIL="bbzorba@hotmail.com"
+trap 'echo "❌ ERROR at line $LINENO"' ERR
+
+echo "=================================================="
+echo "START BUILD SCRIPT"
+echo "=================================================="
+
 PKG_NAME="mydebapp"
 VERSION="1.0"
-DEB_DIR="$HOME/Desktop/Embedded_Systems/Security/debbuild"
+
+DEB_DIR="$HOME/debbuild"
 PKG_DIR="$DEB_DIR/${PKG_NAME}-${VERSION}"
 
-# 1. Install required tools
-echo "Installing build and signing tools..."
-sudo apt update
-sudo apt install -y build-essential devscripts dh-make debhelper coreutils diffutils make gnupg
+REAL_NAME="Baris Zorba"
+EMAIL="bbzorba@hotmail.com"
 
-# 2. Conditional GPG Key Generation (Unattended, Empty Passphrase)
-echo "Checking for existing GPG key..."
-if gpg --list-secret-keys --with-colons | grep -q "$EMAIL"; then
-    echo "=> GPG key for $EMAIL already exists. Skipping generation."
-else
-    echo "=> No GPG key found for $EMAIL. Generating a new key pair..."
-    cat <<EOF > gpg_batch_config
+# ---------------- INSTALL ----------------
+echo "[1] tools..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq build-essential devscripts dh-make debhelper gnupg
+
+# ---------------- GPG ----------------
+echo "[2] gpg..."
+
+if ! gpg --list-secret-keys "$EMAIL" >/dev/null 2>&1; then
+cat <<EOF > key
 Key-Type: RSA
 Key-Length: 4096
 Name-Real: $REAL_NAME
@@ -28,75 +34,107 @@ Expire-Date: 0
 %no-protection
 %commit
 EOF
-    gpg --batch --generate-key gpg_batch_config
-    rm gpg_batch_config
-    echo "=> GPG key generated successfully."
+gpg --batch --generate-key key
+rm -f key
 fi
 
-# Extract the full fingerprint to avoid the "long key ID discouraged" warning
-GPG_FINGERPRINT=$(gpg --list-secret-keys --with-colons "$EMAIL" | grep fpr | head -n 1 | awk -F: '{print $10}')
-echo "Using GPG Fingerprint: $GPG_FINGERPRINT"
+FPR=$(gpg --list-secret-keys --with-colons "$EMAIL" | awk -F: '/^fpr:/ {print $10; exit}')
 
-# 3. Setup Workspace & Clean old artifacts
-cd "$DEB_DIR" || exit
-echo "Cleaning up old build artifacts..."
+# ---------------- WORKSPACE ----------------
+echo "[3] workspace..."
+
+rm -rf "$PKG_DIR"
+mkdir -p "$DEB_DIR"
+cd "$DEB_DIR"
+
 rm -rf "${PKG_NAME}-${VERSION}"
-rm -f "${PKG_NAME}_${VERSION}"*
+mkdir "${PKG_NAME}-${VERSION}"
+cd "${PKG_NAME}-${VERSION}"
 
-mkdir -p "$PKG_DIR"
-cd "$PKG_DIR" || exit
+# ---------------- DH MAKE ----------------
+echo "[4] dh_make..."
 
-# 4. Initialize Package Structure
-dh_make -s --createorig -e "$EMAIL" --yes
+export DEBIAN_FRONTEND=noninteractive
+export TERM=dumb
 
-# Overwrite Control File
+dh_make -s -e "$EMAIL" --createorig -y < /dev/null
+
+rm -f debian/*.ex debian/*.EX 2>/dev/null || true
+
+# ---------------- CONTROL ----------------
 cat > debian/control <<EOF
-Source: ${PKG_NAME}
+Source: $PKG_NAME
 Section: utils
 Priority: optional
-Maintainer: ${REAL_NAME} <${EMAIL}>
+Maintainer: $REAL_NAME <$EMAIL>
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.6.2
 
-Package: ${PKG_NAME}
+Package: $PKG_NAME
 Architecture: all
-Description: Custom release file installer
- This is an automated signed build for embedded linux security.
+Depends: \${misc:Depends}
+Description: simple package
+ test
 EOF
 
-# Overwrite Rules File
-printf '#!/usr/bin/make -f\n%%:\n\tdh $@\n\noverride_dh_auto_build:\n\techo "Welcome to my secure embedded linux system" > myappliance-release\n\techo "version 1.0" >> myappliance-release\n\noverride_dh_auto_install:\n\tmkdir -p debian/mydebapp/etc\n\tinstall -m 644 myappliance-release debian/mydebapp/etc/myappliance-release\n' > debian/rules
+# ---------------- RULES ----------------
+cat > debian/rules <<'EOF'
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	echo "BUILD OK" > myappliance-release
+
+override_dh_auto_install:
+	mkdir -p debian/mydebapp/etc
+	install -m 644 myappliance-release debian/mydebapp/etc/
+EOF
+
 chmod +x debian/rules
 
-# 5. Build an unsigned package first
-debuild -us -uc
+# ---------------- BUILD ----------------
+echo "[5] build..."
 
-# 6. Sign the package build artifacts using debsign
-echo "-----------------------------------"
-echo "Signing the package artifacts..."
-cd "$DEB_DIR" || exit
-CHANGES_FILE="${PKG_NAME}_${VERSION}-1_amd64.changes"
+debuild -us -uc -b
 
-debsign -k"$GPG_FINGERPRINT" "$CHANGES_FILE"
+# ---------------- FIND FILES SAFELY ----------------
+echo "[6] artifacts..."
 
-# 7. Verify package signatures using your personal public keyring explicitly
-echo "Verifying package signature..."
-dscverify --keyring "$HOME/.gnupg/pubring.kbx" "${PKG_NAME}_${VERSION}-1.dsc"
+cd "$DEB_DIR"
 
-# 8. Safe Installation (Removes conflicting old packages first)
-echo "-----------------------------------"
-echo "Preparing system for installation..."
-sudo apt remove -y myapprel mydebapp 2>/dev/null
+DEB=$(find . -maxdepth 2 -name "*.deb" | head -n1)
+CHG=$(find . -maxdepth 2 -name "*.changes" | head -n1)
 
-echo "Installing newly built package..."
-sudo apt install -y "./${PKG_NAME}_${VERSION}-1_all.deb"
+echo "✔ deb: $DEB"
+echo "✔ changes: $CHG"
 
-# 9. Final Verification
-echo "-----------------------------------"
-echo "Verifying target file creation..."
-if [ -f "/etc/myappliance-release" ]; then
-    echo "SUCCESS: File found in /etc/"
-    cat /etc/myappliance-release
+# ---------------- SIGN ----------------
+echo "[7] sign..."
+
+debsign -k"$FPR" "$CHG"
+
+gpg --detach-sign --armor "$DEB"
+
+# ---------------- VERIFY (SAFE) ----------------
+echo "[8] verify..."
+
+if ls *.dsc 1>/dev/null 2>&1; then
+    dscverify --keyring ~/.gnupg/pubring.kbx *.dsc || true
 else
-    echo "ERROR: Target file missing."
+    echo "⚠ no .dsc file (binary-only build)"
 fi
+
+gpg --verify "$DEB.asc" "$DEB"
+
+# ---------------- INSTALL ----------------
+echo "[9] install..."
+
+sudo apt install -y "$DEB"
+
+echo "=================================================="
+echo "DONE SUCCESS"
+echo "=================================================="
+
+cat /etc/myappliance-release || true

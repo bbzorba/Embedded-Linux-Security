@@ -1,0 +1,4 @@
+# Signature GPG
+%_gpg_path /root/.gnupg
+%_gpg_name Matt St. Onge
+%_gpgbin /usr/bin/gpg2
